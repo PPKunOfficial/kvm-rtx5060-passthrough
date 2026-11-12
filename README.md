@@ -42,7 +42,7 @@
 | `win11.xml` | libvirt 域定义模板（已通过 schema 校验） |
 | `win11-working.xml` | 最终可用配置参考（含 vBIOS + 假电池 SSDT + 磁盘） |
 | `vfio-boot-mode` | 切换下一次启动：`host`（Linux 用独显）/ `vm`（直通，默认）/ `status` |
-| `gpu-rtx5060-vbios.rom` | 从 `GB206.rom` 偏移 0x35800 提取的 64K vBIOS（PCIR 10DE:2D19，校验和 0） |
+| `gpu-rtx5060-vbios.rom` | 从 `GB206.rom` 偏移 0x35800 提取的 64K vBIOS（PCIR 10DE:2D19，校验和 0）。**不入库**，按记录文档 §2.2 从你自己的转储提取 |
 | `ssdt-battery.aml` / `.dsl` | 假电池 SSDT，**Code 43 的关键** |
 | `13-fix-rom-ssdt-paths.sh` | 把 vBIOS/SSDT 安装到 `/var/lib/libvirt/images` 并改写域定义 |
 | `14-usb-controller-passthrough.sh` | USB-C 控制器直通配置（GRUB + XML，配套 15） |
