@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# 在“直通模式（vfio）”和“宿主机显卡模式（nvidia）”之间切换下一次启动。
+# 用法：
+#   sudo vfio-boot-mode host    下次启动让 Linux 使用独显（vfio 关闭）
+#   sudo vfio-boot-mode vm      下次启动恢复直通模式（默认）
+#   sudo vfio-boot-mode status  查看当前绑定与下一次启动设置
+set -euo pipefail
+
+if [[ ${EUID} -ne 0 ]]; then
+    exec sudo -- "$0" "$@"
+fi
+
+HOST_ENTRY='CachyOS (Host GPU, no passthrough)'
+CMD=${1:-status}
+
+case "$CMD" in
+    host)
+        command -v grub-reboot >/dev/null || {
+            echo "错误：找不到 grub-reboot。" >&2
+            exit 1
+        }
+        grub-reboot "$HOST_ENTRY"
+        cat <<'EOF'
+已设置：下次启动 = 宿主机显卡模式
+  - 独显由 Linux 的 nvidia 驱动接管，vfio 关闭
+  - 只对下一次启动生效，之后自动回到直通模式
+  - 此模式下带 RTX 5060 直通的 Windows VM 无法启动
+
+现在可以重启：sudo reboot
+EOF
+        ;;
+    vm)
+        command -v grub-reboot >/dev/null || {
+            echo "错误：找不到 grub-reboot。" >&2
+            exit 1
+        }
+        grub-reboot 0
+        cat <<'EOF'
+已设置：下次启动 = 直通模式（默认）
+  - vfio-pci 接管 RTX 5060 + HDMI 音频
+  - Windows VM 可以启动
+
+现在可以重启：sudo reboot
+EOF
+        ;;
+    status)
+        echo "=== GRUB 下一次启动设置 ==="
+        grub-editenv list || true
+        echo
+        echo "=== 独显当前驱动 ==="
+        lspci -nnk -d 10de:2d19 || true
+        echo
+        lspci -nnk -d 10de:22eb || true
+        echo
+        echo "=== 说明 ==="
+        echo "vfio-pci = 直通模式；nvidia = 宿主机显卡模式"
+        ;;
+    -h|--help|help)
+        cat <<'EOF'
+用法：sudo vfio-boot-mode {host|vm|status}
+
+  host    下次启动让 Linux 使用独显（vfio 关闭，Windows VM 不可用）
+  vm      下次启动恢复 vfio 直通（默认启动项）
+  status  显示当前 GPU 绑定和下一次启动设置
+
+注意：本脚本只切换 vfio 绑定，不切换 BIOS 的 MUX 显示模式。
+      MUX 仍是“混合输出”，所以宿主机模式是混合模式，不是独显直连。
+EOF
+        ;;
+    *)
+        echo "未知参数：$CMD" >&2
+        echo "用法：sudo vfio-boot-mode {host|vm|status}" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,14 @@
+# 安装介质与虚拟磁盘（体积大，不入库）
+*.iso
+*.qcow2
+*.img
+*.raw
+
+# 厂商固件：vBIOS 属 NVIDIA 版权，且与具体机器绑定，不随仓库分发。
+# 需要时按 GPU-PASSTHROUGH-NOTES.md §2.2 从自己机器的 GPU-Z 转储里提取。
+GB206.rom
+gpu-rtx5060-vbios.rom
+
+# 中间快照 / 备份：仓库只保留 win11-working.xml 和 win11.xml
+win11-with-romfile.xml
+*.bak-*

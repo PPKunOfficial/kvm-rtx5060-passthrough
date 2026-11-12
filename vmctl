@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# vmctl — 同时操控 Linux 宿主机与 win11 客户机的辅助工具
+#
+# 宿主机侧直接用 shell；客户机侧走 QEMU guest agent（virtio-serial，
+# org.qemu.guest_agent.0，不依赖网络）。控制台画面走 virsh screenshot，
+# 没有 agent 时可用 send-key 兜底。
+#
+# 用法:
+#   vmctl status                 # 状态：域/agent/GPU 绑定/IP
+#   vmctl doctor                 # 逐项体检通道
+#   vmctl run -- <win 命令>      # 客户机 cmd.exe 执行，打印 stdout/stderr/退出码
+#   vmctl ps  -- <PowerShell>    # 客户机 PowerShell 执行
+#   vmctl ip                     # 客户机 IP
+#   vmctl shot [file.png]        # 截客户机画面
+#   vmctl get <winpath> [out]    # 从客户机取文件
+#   vmctl put <local> <winpath>  # 往客户机放文件
+#   vmctl key <KEY_...> ...      # 向客户机发按键（virsh send-key 透传）
+#   vmctl pci                    # 宿主侧看 qemu 的 PCI 视图（GPU BAR/ROM）
+#   vmctl devinfo                # 客户机侧看 10de 设备的 PnP 状态/资源
+#
+set -uo pipefail
+
+DOM="${VMCTL_DOM:-win11}"
+VCONN="${VMCTL_CONN:-qemu:///system}"
+QGA_TIMEOUT="${QGA_TIMEOUT:-30}"
+CHUNK=$((1024 * 1024)) # guest-file-read/write 单块字节数
+
+v() { virsh -c "$VCONN" "$@"; }
+
+die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+
+# ---- QGA 基础 -------------------------------------------------------------
+
+qga() { # $1 = JSON
+  v qemu-agent-command "$DOM" --timeout "$QGA_TIMEOUT" "$1" 2>&1
+}
+
+qga_json() { # $1 = JSON, 不打印错误行
+  v qemu-agent-command "$DOM" --timeout "$QGA_TIMEOUT" "$1" 2>/dev/null
+}
+
+need_agent() {
+  local out
+  out=$(qga_json '{"execute":"guest-ping"}')
+  case "$out" in
+  *'"return"'*) return 0 ;;
+  *)
+    printf 'QEMU guest agent 不通：%s\n' "${out:-无响应}" >&2
+    printf '提示：客户机内检查服务 qemu-ga（sc query qemu-ga）；或稍等重试（装更新/高负载时会超时）。\n' >&2
+    return 1
+    ;;
+  esac
+}
+
+# guest-exec + 轮询，输出 stdout/stderr，返回客户机退出码
+ga_exec() { # $1 = path, $2.. = args
+  local path="$1"; shift
+  local args_json pid st out err rc i
+  args_json=$(jq -nc '$ARGS.positional' --args -- "$@")
+  local req
+  req=$(jq -nc --arg p "$path" --argjson a "$args_json" \
+    '{execute:"guest-exec",arguments:{path:$p,arg:$a,"capture-output":true}}')
+  pid=$(qga_json "$req" | jq -r '.return.pid // empty')
+  [ -n "$pid" ] || die "guest-exec 未返回 pid（agent 不通或命令被拒）"
+
+  for i in $(seq 1 600); do
+    st=$(qga_json "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}")
+    if [ "$(jq -r '.return.exited // false' <<<"$st")" = "true" ]; then
+      out=$(jq -r '.return."out-data" // empty' <<<"$st" | base64 -d 2>/dev/null)
+      err=$(jq -r '.return."err-data" // empty' <<<"$st" | base64 -d 2>/dev/null)
+      rc=$(jq -r '.return."exitcode" // 0' <<<"$st")
+      [ -n "$out" ] && printf '%s' "$out"
+      [ -n "$err" ] && printf '%s' "$err" >&2
+      return "${rc:-0}"
+    fi
+    sleep 0.5
+  done
+  die "命令超时（300s）: $path $*"
+}
+
+win_cmd() { ga_exec cmd.exe /c "$*"; }
+win_ps() { ga_exec powershell.exe -NoProfile -NonInteractive -Command "$*"; }
+
+# ---- 命令 ----------------------------------------------------------------
+
+cmd_status() {
+  printf '域        : '; v domstate "$DOM" 2>&1
+  printf 'agent     : '; qga_json '{"execute":"guest-ping"}' | grep -q return && echo OK || echo 不通
+  printf 'dGPU 绑定 : '; readlink -f /sys/bus/pci/devices/0000:01:00.0/driver 2>/dev/null | sed 's#.*/##' || echo '无驱动'
+  printf '客户机 IP :\n'
+  cmd_ip | sed 's/^/  /'
+}
+
+cmd_doctor() {
+  local ok=0
+  printf '%-28s' '1. libvirt 域可见'; if v domstate "$DOM" >/dev/null 2>&1; then echo OK; else echo FAIL; ok=1; fi
+  printf '%-28s' '2. guest agent 通道'; if need_agent >/dev/null 2>&1; then echo OK; else echo FAIL; ok=1; fi
+  printf '%-28s' '3. 客户机命令执行'; if win_cmd 'ver' >/dev/null 2>&1; then echo OK; else echo FAIL; ok=1; fi
+  printf '%-28s' '4. 客户机网络'; if cmd_ip >/dev/null 2>&1 && [ -n "$(cmd_ip 2>/dev/null)" ]; then echo OK; else echo 'WARN'; fi
+  printf '%-28s' '5. GPU 在客户机可见'; if cmd_pci | grep -q '10de:2d19'; then echo OK; else echo 'WARN'; fi
+  return $ok
+}
+
+cmd_ip() {
+  qga_json '{"execute":"guest-network-get-interfaces"}' |
+    jq -r '.return[]? | .name as $n | ."ip-addresses"[]? | select(."ip-address-type"=="ipv4") | "\($n)\t\(."ip-address")"' 2>/dev/null
+}
+
+cmd_shot() {
+  local out="${1:-/tmp/win11-$(date +%H%M%S).png}" tmp
+  tmp=$(mktemp --suffix=.ppm)
+  v screenshot "$DOM" "$tmp" >/dev/null 2>&1 || die "screenshot 失败（域未运行？）"
+  cp "$tmp" "$out"; rm -f "$tmp"
+  printf '%s\n' "$out"
+}
+
+cmd_get() { # $1 winpath, $2 local(默认同名)
+  local winpath="$1" out="${2:-$(basename "${1//\\//}")}" handle
+  handle=$(qga_json "$(jq -nc --arg p "$winpath" '{execute:"guest-file-open",arguments:{path:$p,mode:"r"}}')" |
+    jq -r '.return // empty')
+  [ -n "$handle" ] || die "打开失败: $winpath"
+  : >"$out"
+  while :; do
+    local r b64 eof
+    r=$(qga_json "{\"execute\":\"guest-file-read\",\"arguments\":{\"handle\":$handle,\"count\":$CHUNK}}")
+    b64=$(jq -r '.return."buf-b64" // empty' <<<"$r")
+    eof=$(jq -r '.return.eof // true' <<<"$r")
+    [ -n "$b64" ] && printf '%s' "$b64" | base64 -d >>"$out"
+    [ "$eof" = "true" ] && break
+  done
+  qga_json "{\"execute\":\"guest-file-close\",\"arguments\":{\"handle\":$handle}}" >/dev/null
+  printf '%s (%s bytes)\n' "$out" "$(stat -c%s "$out")"
+}
+
+cmd_put() { # $1 local, $2 winpath
+  local src="$1" winpath="$2" handle offset=0 total size
+  [ -f "$src" ] || die "没有文件: $src"
+  size=$(stat -c%s "$src")
+  handle=$(qga_json "$(jq -nc --arg p "$winpath" '{execute:"guest-file-open",arguments:{path:$p,mode:"w"}}')" |
+    jq -r '.return // empty')
+  [ -n "$handle" ] || die "打开失败（路径/权限？）: $winpath"
+  while [ "$offset" -lt "$size" ]; do
+    total=$((size - offset))
+    [ "$total" -gt "$CHUNK" ] && total=$CHUNK
+    local b64
+    b64=$(tail -c +$((offset + 1)) "$src" | head -c "$total" | base64 -w0)
+    qga_json "$(jq -nc --arg b "$b64" --argjson h "$handle" \
+      '{execute:"guest-file-write",arguments:{handle:$h,"buf-b64":$b}}')" | grep -q return || die "写入失败 @$offset"
+    offset=$((offset + total))
+  done
+  qga_json "{\"execute\":\"guest-file-close\",\"arguments\":{\"handle\":$handle}}" >/dev/null
+  printf '已写入 %s -> %s (%s bytes)\n' "$src" "$winpath" "$size"
+}
+
+cmd_usb() {
+  printf '%-10s %-10s %-8s %s\n' 'BUS' 'DEV' 'VID:PID' 'CONTROLLER / MODEL'
+  for d in /sys/bus/usb/devices/*-*; do
+    [ -f "$d/idVendor" ] || continue
+    path=$(udevadm info -q property -p "$d" 2>/dev/null | sed -n 's/^ID_PATH=//p')
+    printf '%-10s %-10s %-8s %s\n' \
+      "$(cat "$d/busnum" 2>/dev/null)" "$(basename "$d")" \
+      "$(cat "$d/idVendor"):$(cat "$d/idProduct")" \
+      "${path:-?}  $(cat "$d/product" 2>/dev/null)"
+  done
+}
+
+cmd_key() { v send-key "$DOM" "$@"; }
+
+cmd_pci() {
+  v qemu-monitor-command "$DOM" --hmp 'info pci' 2>&1 |
+    grep -A6 -E '1000:002|10de:2d19|10de:22eb' |
+    sed 's/^/  /'
+}
+
+cmd_devinfo() {
+  win_ps 'Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+    Format-List FriendlyName,InstanceId,Status,Problem,ProblemDescription;
+    Get-PnpDevice -InstanceId "*VEN_10DE*" -ErrorAction SilentlyContinue |
+    Format-List FriendlyName,InstanceId,Status,Problem'
+}
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+status) cmd_status ;;
+doctor) cmd_doctor ;;
+ip) cmd_ip ;;
+shot) shift; cmd_shot "$@" ;;
+get) shift; cmd_get "$@" ;;
+put) shift; cmd_put "$@" ;;
+key) shift; cmd_key "$@" ;;
+usb) cmd_usb ;;
+pci) cmd_pci ;;
+devinfo) cmd_devinfo ;;
+run)
+  shift; [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die '用法: vmctl run -- <命令>'
+  win_cmd "$@"
+  ;;
+ps)
+  shift; [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die '用法: vmctl ps -- <PowerShell 命令>'
+  win_ps "$@"
+  ;;
+'' | -h | --help | help) usage ;;
+*) die "未知子命令: $1（vmctl help）" ;;
+esac
